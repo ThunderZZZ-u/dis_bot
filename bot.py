@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import re
 import sqlite3
@@ -15,12 +16,6 @@ DB_NAME = "stamps.db"
 
 # 審核者身分組 ID
 AUDITOR_ROLE_ID = 1527104229045436416
-
-# 碳碳動態圖連結
-CARBON_CAT_GIF_URL = (
-    "https://cdn.discordapp.com/attachments/1551126968768921602/1551235720453296138/cat_look.gif"
-    "?ex=6ab13c58&is=6aafead8&hm=53291691efdff6eaed417394f69895e745acfdd131e45218dad4242b69a375f3&"
-)
 
 
 # --- 資料庫操作（線程安全與原子操作） ---
@@ -100,7 +95,7 @@ class StampBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.guilds = True
-        intents.message_content = True  # 啟用讀取訊息以接收上傳成果
+        intents.message_content = True  # 啟用以讀取成果上傳訊息
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -212,7 +207,10 @@ class AuditView(View):
         for item in self.children:
             item.disabled = True
 
-        total = add_user_stamp(self.target_user.id, self.stamp_reward)
+        # 使用執行緒池寫入資料庫，避免阻塞
+        total = await asyncio.to_thread(
+            add_user_stamp, self.target_user.id, self.stamp_reward
+        )
 
         embed = (
             interaction.message.embeds[0].copy()
@@ -364,15 +362,29 @@ class TaskProgressView(View):
                 pass
 
         proof_text = msg.content.strip() or "（執行者未附帶文字說明）"
-        attachment_url = msg.attachments[0].url if msg.attachments else None
+        
+        # 處理檔案上傳：下載原始附件並包裝為 Bot 的 File，徹底杜絕刪除訊息後造成的 CDN 破圖與下載失敗
+        upload_file: discord.File | None = None
+        if msg.attachments:
+            try:
+                att = msg.attachments[0]
+                file_bytes = await att.read()
+                # 取得副檔名（預設 png），避免中文檔名或特殊字元導致 Embed 無法渲染
+                ext = att.filename.split(".")[-1] if "." in att.filename else "png"
+                safe_filename = f"proof_{int(time.time())}.{ext}"
+                upload_file = discord.File(io.BytesIO(file_bytes), filename=safe_filename)
+            except Exception as e:
+                print(f"讀取回報附件失敗: {e}")
 
-        if not attachment_url:
+        # 若未上傳檔案但包含外站圖片連結，提取之
+        image_url = None
+        if not upload_file:
             img_urls = re.findall(
                 r"https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?",
                 proof_text,
                 re.IGNORECASE,
             )
-            attachment_url = next(
+            image_url = next(
                 (
                     url
                     for url in img_urls
@@ -397,11 +409,10 @@ class TaskProgressView(View):
             color=discord.Color.gold(),
         )
 
-        if attachment_url:
-            embed.set_image(url=attachment_url)
-            embed.set_thumbnail(url=CARBON_CAT_GIF_URL)
-        else:
-            embed.set_image(url=CARBON_CAT_GIF_URL)
+        if upload_file:
+            embed.set_image(url=f"attachment://{upload_file.filename}")
+        elif image_url:
+            embed.set_image(url=image_url)
 
         audit_view = AuditView(
             target_user=self.target_user,
@@ -409,24 +420,23 @@ class TaskProgressView(View):
         )
 
         try:
-            await interaction.channel.send(
-                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
-                embed=embed,
-                view=audit_view,
-            )
-        except discord.HTTPException:
-            # 遭遇圖片 URL 防盜鏈或失效時降級發送
-            embed.set_image(url=None)
-            embed.set_thumbnail(url=None)
-            try:
+            if upload_file:
+                await interaction.channel.send(
+                    content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
+                    embed=embed,
+                    file=upload_file,
+                    view=audit_view,
+                )
+            else:
                 await interaction.channel.send(
                     content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
                     embed=embed,
                     view=audit_view,
                 )
-            except discord.HTTPException:
-                pass
+        except discord.HTTPException as e:
+            print(f"發送審核卡片失敗: {e}")
 
+        # 刪除原訊息（現在即使刪除，Bot 已重新轉發圖片，不會再出現下載失敗或破圖）
         try:
             await msg.delete()
         except (discord.HTTPException, discord.Forbidden):
@@ -702,9 +712,12 @@ async def add_stamp(
         )
         return
 
-    total = add_user_stamp(member.id, round(amount, 2))
+    # 先 defer 預留處理時間，避免 10062 Unknown interaction
+    await interaction.response.defer()
+
+    total = await asyncio.to_thread(add_user_stamp, member.id, round(amount, 2))
     action = "增加" if amount >= 0 else "扣除"
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"💮 已為 {member.mention} {action} **{abs(round(amount, 2)):g}** 枚印章！"
         f"目前總計：**{total:g}** 枚！"
     )
@@ -717,9 +730,11 @@ async def check_stamp(
     interaction: discord.Interaction,
     member: discord.Member | None = None,
 ):
+    await interaction.response.defer()
+
     target = member or interaction.user
-    stamps = get_user_stamp(target.id)
-    await interaction.response.send_message(
+    stamps = await asyncio.to_thread(get_user_stamp, target.id)
+    await interaction.followup.send(
         f"💮 {target.mention} 目前擁有 **{stamps:g}** 枚印章！"
     )
 
@@ -727,9 +742,11 @@ async def check_stamp(
 @bot.tree.command(name="stamp_leaderboard", description="查看伺服器印章排行榜")
 @app_commands.guild_only()
 async def stamp_leaderboard(interaction: discord.Interaction):
-    rows = get_leaderboard(10)
+    await interaction.response.defer()
+
+    rows = await asyncio.to_thread(get_leaderboard, 10)
     if not rows:
-        await interaction.response.send_message("目前還沒有任何人獲得印章！")
+        await interaction.followup.send("目前還沒有任何人獲得印章！")
         return
 
     embed = discord.Embed(
@@ -739,7 +756,7 @@ async def stamp_leaderboard(interaction: discord.Interaction):
     for idx, (uid, count) in enumerate(rows, 1):
         desc.append(f"**第 {idx} 名**：<@{uid}> — `{count:g}` 枚")
     embed.description = "\n".join(desc)
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 if __name__ == "__main__":
