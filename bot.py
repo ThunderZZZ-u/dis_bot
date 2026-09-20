@@ -51,22 +51,28 @@ def get_user_stamp(user_id: int) -> float:
 
 
 def add_user_stamp(user_id: int, amount: float) -> float:
-    """原子更新使用者的印章數，正確處理負數加減，並限制印章數量不得低於 0"""
+    """使用明確交易保證正確加減（包含負數扣章），並限制印章數量不得低於 0"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        # 1. 先查出目前印章數
+        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+
+        current_count = row[0] if row else 0.0
+        # 2. 在 Python 端做精確的加減與下限防護
+        new_count = max(0.0, round(current_count + amount, 2))
+
+        # 3. 寫回資料庫
         cursor.execute(
             """
             INSERT INTO stamps (user_id, count)
-            VALUES (?, MAX(0.0, ROUND(?, 2)))
-            ON CONFLICT(user_id) DO UPDATE SET
-                count = MAX(0.0, ROUND(count + ?, 2));
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET count = excluded.count;
             """,
-            (user_id, amount, amount),
+            (user_id, new_count),
         )
-        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (user_id,))
-        new_count = cursor.fetchone()[0]
         conn.commit()
-        return round(new_count, 2)
+        return new_count
 
 
 def get_leaderboard(limit: int = 10):
