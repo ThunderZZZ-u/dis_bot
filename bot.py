@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import sqlite3
@@ -99,8 +100,7 @@ class StampBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.guilds = True
-        # 啟用讀取訊息內容以接收上傳的成果檔案
-        intents.message_content = True
+        intents.message_content = True  # 啟用讀取訊息以接收上傳成果
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -126,7 +126,7 @@ class RejectReasonModal(Modal, title="填寫駁回原因"):
     )
 
     def __init__(
-        self, audit_view: "AuditView", origin_message: discord.Message
+        self, audit_view: "AuditView", origin_message: discord.Message | None
     ):
         super().__init__()
         self.audit_view = audit_view
@@ -144,12 +144,11 @@ class RejectReasonModal(Modal, title="填寫駁回原因"):
         for item in self.audit_view.children:
             item.disabled = True
 
-        # 立即回傳 ephemeral 避免 3 秒超時
         await interaction.response.send_message(
             "✅ 已駁回該任務！", ephemeral=True
         )
 
-        target_msg = self.origin_message
+        target_msg = self.origin_message or interaction.message
         embed = (
             target_msg.embeds[0].copy()
             if target_msg and target_msg.embeds
@@ -176,7 +175,7 @@ class RejectReasonModal(Modal, title="填寫駁回原因"):
                 f"❌ 審核不通過！審核員 {interaction.user.mention} 駁回了 {self.audit_view.target_user.mention} 的任務回報。\n"
                 f"**原因**：{self.reason.value}"
             )
-        except discord.Forbidden:
+        except (discord.HTTPException, discord.Forbidden):
             pass
 
 
@@ -236,7 +235,7 @@ class AuditView(View):
             await interaction.channel.send(
                 f"🎉 審核通過！審核員 {interaction.user.mention} 已為 {self.target_user.mention} 增加 **{self.stamp_reward:g}** 枚印章！（目前持有：`{total:g}` 枚）"
             )
-        except discord.Forbidden:
+        except (discord.HTTPException, discord.Forbidden):
             pass
 
     @discord.ui.button(
@@ -263,7 +262,7 @@ class AuditView(View):
         await interaction.response.send_modal(modal)
 
 
-# --- 第二階段：任務執行中 View（支援直接上傳附件） ---
+# --- 第二階段：任務執行中 View ---
 
 
 class TaskProgressView(View):
@@ -281,7 +280,6 @@ class TaskProgressView(View):
         self.target_user = target_user
         self.task_name = task_name
         self.stamp_reward = stamp_reward
-        # 使用 is_completed 避免覆蓋 View 原生 is_finished 方法
         self.is_completed = False
         self.message: discord.Message | None = None
 
@@ -320,7 +318,6 @@ class TaskProgressView(View):
             )
             return
 
-        # 提示使用者直接在頻道發送檔案或說明文字
         await interaction.response.send_message(
             "📸 請在 **120 秒內**直接在此頻道**發送成果文字**或**上傳截圖/檔案**！",
             ephemeral=True,
@@ -333,17 +330,15 @@ class TaskProgressView(View):
             )
 
         try:
-            # 等待使用者在當前頻道發布回報內容
             msg: discord.Message = await interaction.client.wait_for(
                 "message", check=check, timeout=120.0
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             await interaction.followup.send(
                 "⌛ 上傳逾時，請重新點擊按鈕回報！", ephemeral=True
             )
             return
 
-        # 再次檢查任務狀態（避免等待期間發布者已中途取消任務）
         if self.is_completed:
             await interaction.followup.send(
                 "⚠️ 該任務已被取消或過期！", ephemeral=True
@@ -359,22 +354,18 @@ class TaskProgressView(View):
             "✅ 任務成果已成功提交，碳碳正在審核中！", ephemeral=True
         )
 
-        # 更新進行中卡片狀態
         if self.message:
             try:
                 await self.message.edit(
                     content=f"🎯 {self.target_user.mention} 已提交任務【{self.task_name}】！等待審核中...",
                     view=self,
                 )
-            except discord.HTTPException:
+            except (discord.HTTPException, discord.Forbidden):
                 pass
 
         proof_text = msg.content.strip() or "（執行者未附帶文字說明）"
-        attachment_url = (
-            msg.attachments[0].url if msg.attachments else None
-        )  # 取得上傳的第一個檔案
+        attachment_url = msg.attachments[0].url if msg.attachments else None
 
-        # 若未上傳檔案，但訊息中貼有圖片連結，自動提取
         if not attachment_url:
             img_urls = re.findall(
                 r"https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?",
@@ -406,7 +397,6 @@ class TaskProgressView(View):
             color=discord.Color.gold(),
         )
 
-        # 成果附帶圖片時顯示大圖並將碳碳放在右上角縮圖；若無圖片則大圖顯示碳碳
         if attachment_url:
             embed.set_image(url=attachment_url)
             embed.set_thumbnail(url=CARBON_CAT_GIF_URL)
@@ -425,18 +415,21 @@ class TaskProgressView(View):
                 view=audit_view,
             )
         except discord.HTTPException:
-            embed.set_image(url=CARBON_CAT_GIF_URL)
+            # 遭遇圖片 URL 防盜鏈或失效時降級發送
+            embed.set_image(url=None)
             embed.set_thumbnail(url=None)
-            await interaction.channel.send(
-                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
-                embed=embed,
-                view=audit_view,
-            )
+            try:
+                await interaction.channel.send(
+                    content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
+                    embed=embed,
+                    view=audit_view,
+                )
+            except discord.HTTPException:
+                pass
 
-        # 刪除使用者在頻道發送的原始附件訊息，維持頻道整潔
         try:
             await msg.delete()
-        except discord.HTTPException:
+        except (discord.HTTPException, discord.Forbidden):
             pass
 
     @discord.ui.button(
@@ -539,6 +532,7 @@ class TaskPublishView(View):
         for item in self.children:
             item.disabled = True
 
+        # 更新原始發布訊息卡片
         await interaction.response.edit_message(
             content=f"⚔️ {self.target_user.mention} 接受了由 {self.author.mention} 發布的任務【{self.task_name}】！",
             view=self,
@@ -552,12 +546,18 @@ class TaskPublishView(View):
             self.time_limit,
         )
         expire_time = int(time.time()) + self.time_limit
-        msg = await interaction.channel.send(
-            f"⏳ {self.target_user.mention} 正在進行任務：**{self.task_name}**\n"
-            f"截止時間：<t:{expire_time}:R>（<t:{expire_time}:T>），完成後請點擊下方按鈕回報。",
-            view=progress_view,
-        )
-        progress_view.message = msg
+
+        # 使用 followup.send 避免缺少常態發言權限與 3 秒逾時問題
+        try:
+            msg = await interaction.followup.send(
+                f"⏳ {self.target_user.mention} 正在進行任務：**{self.task_name}**\n"
+                f"截止時間：<t:{expire_time}:R>（<t:{expire_time}:T>），完成後請點擊下方按鈕回報。",
+                view=progress_view,
+                wait=True,
+            )
+            progress_view.message = msg
+        except Exception as e:
+            print(f"發送進行中任務訊息失敗: {e}")
 
     @discord.ui.button(
         label="拒絕任務", style=discord.ButtonStyle.danger, emoji="✖️"
@@ -649,14 +649,12 @@ async def assign_task(
         )
         return
 
-    # 防呆：不能指派任務給自己
     if member.id == interaction.user.id:
         await interaction.response.send_message(
             "❌ 不能指派任務給自己！", ephemeral=True
         )
         return
 
-    # 防呆：不能指派給機器人
     if member.bot:
         await interaction.response.send_message(
             "❌ 不能指派任務給機器人！", ephemeral=True
