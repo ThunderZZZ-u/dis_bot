@@ -99,6 +99,8 @@ class StampBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.guilds = True
+        # 啟用讀取訊息內容以接收上傳的成果檔案
+        intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
@@ -261,110 +263,7 @@ class AuditView(View):
         await interaction.response.send_modal(modal)
 
 
-# --- 第二階段：回報成果 Modal 與任務進度 View ---
-
-
-class TaskSubmissionModal(Modal, title="任務成果回報"):
-
-    proof = TextInput(
-        label="成果說明或連結",
-        style=discord.TextStyle.paragraph,
-        placeholder="請輸入完成說明、截圖圖床連結或訊息連結...",
-        required=True,
-        max_length=500,
-    )
-
-    def __init__(self, progress_view: "TaskProgressView"):
-        super().__init__()
-        self.progress_view = progress_view
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # 使用 is_completed 判斷狀態
-        if self.progress_view.is_completed:
-            await interaction.response.send_message(
-                "⚠️ 該任務已結案或已逾期！", ephemeral=True
-            )
-            return
-
-        self.progress_view.is_completed = True
-        self.progress_view.stop()
-        for item in self.progress_view.children:
-            item.disabled = True
-
-        # 立即回傳確認訊息給提交者
-        await interaction.response.send_message(
-            "✅ 任務成果已成功提交，碳碳正在審核中！", ephemeral=True
-        )
-
-        # 更新進行中卡片狀態
-        if self.progress_view.message:
-            try:
-                await self.progress_view.message.edit(
-                    content=f"🎯 {self.progress_view.target_user.mention} 已提交任務【{self.progress_view.task_name}】！等待審核中...",
-                    view=self.progress_view,
-                )
-            except discord.HTTPException:
-                pass
-
-        proof_text = self.proof.value.strip()
-
-        embed = discord.Embed(
-            title="🐾 碳碳審核中...",
-            description=(
-                f"**發布者**：{self.progress_view.author.mention}\n"
-                f"**執行者**：{self.progress_view.target_user.mention}\n"
-                f"**任務內容**：{self.progress_view.task_name}\n"
-                f"**預計獎勵**：`{self.progress_view.stamp_reward:g}` 枚印章\n\n"
-                f"**執行者回報成果**：\n{proof_text[:1024]}\n\n"
-                "請審核員核對成果後點擊下方按鈕發放印章。"
-            ),
-            color=discord.Color.gold(),
-        )
-
-        # 擷取有效圖片網址（排除 Discord 自訂表情與貼圖）
-        img_urls = re.findall(
-            r"https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?",
-            proof_text,
-            re.IGNORECASE,
-        )
-        valid_img_url = next(
-            (
-                url
-                for url in img_urls
-                if not re.search(
-                    r"(?:cdn|media)\.discordapp\.(?:com|net)/(?:emojis|stickers)/",
-                    url,
-                )
-            ),
-            None,
-        )
-
-        # 成果帶圖時顯示大圖並將碳碳放在右上角縮圖；沒圖時大圖顯示碳碳
-        if valid_img_url:
-            embed.set_image(url=valid_img_url)
-            embed.set_thumbnail(url=CARBON_CAT_GIF_URL)
-        else:
-            embed.set_image(url=CARBON_CAT_GIF_URL)
-
-        audit_view = AuditView(
-            target_user=self.progress_view.target_user,
-            stamp_reward=self.progress_view.stamp_reward,
-        )
-
-        try:
-            await interaction.channel.send(
-                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
-                embed=embed,
-                view=audit_view,
-            )
-        except discord.HTTPException:
-            embed.set_image(url=CARBON_CAT_GIF_URL)
-            embed.set_thumbnail(url=None)
-            await interaction.channel.send(
-                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
-                embed=embed,
-                view=audit_view,
-            )
+# --- 第二階段：任務執行中 View（支援直接上傳附件） ---
 
 
 class TaskProgressView(View):
@@ -421,8 +320,124 @@ class TaskProgressView(View):
             )
             return
 
-        modal = TaskSubmissionModal(progress_view=self)
-        await interaction.response.send_modal(modal)
+        # 提示使用者直接在頻道發送檔案或說明文字
+        await interaction.response.send_message(
+            "📸 請在 **120 秒內**直接在此頻道**發送成果文字**或**上傳截圖/檔案**！",
+            ephemeral=True,
+        )
+
+        def check(m: discord.Message):
+            return (
+                m.author.id == self.target_user.id
+                and m.channel.id == interaction.channel_id
+            )
+
+        try:
+            # 等待使用者在當前頻道發布回報內容
+            msg: discord.Message = await interaction.client.wait_for(
+                "message", check=check, timeout=120.0
+            )
+        except TimeoutError:
+            await interaction.followup.send(
+                "⌛ 上傳逾時，請重新點擊按鈕回報！", ephemeral=True
+            )
+            return
+
+        # 再次檢查任務狀態（避免等待期間發布者已中途取消任務）
+        if self.is_completed:
+            await interaction.followup.send(
+                "⚠️ 該任務已被取消或過期！", ephemeral=True
+            )
+            return
+
+        self.is_completed = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.followup.send(
+            "✅ 任務成果已成功提交，碳碳正在審核中！", ephemeral=True
+        )
+
+        # 更新進行中卡片狀態
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=f"🎯 {self.target_user.mention} 已提交任務【{self.task_name}】！等待審核中...",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+        proof_text = msg.content.strip() or "（執行者未附帶文字說明）"
+        attachment_url = (
+            msg.attachments[0].url if msg.attachments else None
+        )  # 取得上傳的第一個檔案
+
+        # 若未上傳檔案，但訊息中貼有圖片連結，自動提取
+        if not attachment_url:
+            img_urls = re.findall(
+                r"https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?",
+                proof_text,
+                re.IGNORECASE,
+            )
+            attachment_url = next(
+                (
+                    url
+                    for url in img_urls
+                    if not re.search(
+                        r"(?:cdn|media)\.discordapp\.(?:com|net)/(?:emojis|stickers)/",
+                        url,
+                    )
+                ),
+                None,
+            )
+
+        embed = discord.Embed(
+            title="🐾 碳碳審核中...",
+            description=(
+                f"**發布者**：{self.author.mention}\n"
+                f"**執行者**：{self.target_user.mention}\n"
+                f"**任務內容**：{self.task_name}\n"
+                f"**預計獎勵**：`{self.stamp_reward:g}` 枚印章\n\n"
+                f"**執行者回報成果**：\n{proof_text[:1024]}\n\n"
+                "請審核員核對成果後點擊下方按鈕發放印章。"
+            ),
+            color=discord.Color.gold(),
+        )
+
+        # 成果附帶圖片時顯示大圖並將碳碳放在右上角縮圖；若無圖片則大圖顯示碳碳
+        if attachment_url:
+            embed.set_image(url=attachment_url)
+            embed.set_thumbnail(url=CARBON_CAT_GIF_URL)
+        else:
+            embed.set_image(url=CARBON_CAT_GIF_URL)
+
+        audit_view = AuditView(
+            target_user=self.target_user,
+            stamp_reward=self.stamp_reward,
+        )
+
+        try:
+            await interaction.channel.send(
+                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
+                embed=embed,
+                view=audit_view,
+            )
+        except discord.HTTPException:
+            embed.set_image(url=CARBON_CAT_GIF_URL)
+            embed.set_thumbnail(url=None)
+            await interaction.channel.send(
+                content=f"<@&{AUDITOR_ROLE_ID}> 有新的任務回報需要審核！",
+                embed=embed,
+                view=audit_view,
+            )
+
+        # 刪除使用者在頻道發送的原始附件訊息，維持頻道整潔
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(
         label="取消任務(發布者/管理員)",
