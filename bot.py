@@ -31,11 +31,9 @@ class StampBot(commands.Bot):
     super().__init__(command_prefix="!", intents=intents)
 
   async def setup_hook(self):
-    # 指派給指定伺服器，啟動後可立即在聊天室按 / 看到指令
-    guild = discord.Object(id=1551126967754035200)
-    self.tree.copy_global_to(guild=guild)
-    await self.tree.sync(guild=guild)
-    print("斜線指令已同步完成！")
+    # 改為全域同步：所有伺服器都能使用指令
+    await self.tree.sync()
+    print("全域斜線指令已同步完成！")
 
 
 bot = StampBot()
