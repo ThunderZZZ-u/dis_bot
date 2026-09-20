@@ -51,7 +51,7 @@ def get_user_stamp(user_id: int) -> float:
 
 
 def add_user_stamp(user_id: int, amount: float) -> float:
-    """原子更新使用者的印章數（相容全版本 SQLite，並限制最低為 0）"""
+    """原子更新使用者的印章數，正確處理負數加減，並限制印章數量不得低於 0"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -59,9 +59,9 @@ def add_user_stamp(user_id: int, amount: float) -> float:
             INSERT INTO stamps (user_id, count)
             VALUES (?, MAX(0.0, ROUND(?, 2)))
             ON CONFLICT(user_id) DO UPDATE SET
-                count = MAX(0.0, ROUND(count + excluded.count, 2));
+                count = MAX(0.0, ROUND(count + ?, 2));
             """,
-            (user_id, amount),
+            (user_id, amount, amount),
         )
         cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (user_id,))
         new_count = cursor.fetchone()[0]
