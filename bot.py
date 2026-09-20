@@ -279,13 +279,14 @@ class TaskSubmissionModal(Modal, title="任務成果回報"):
         self.progress_view = progress_view
 
     async def on_submit(self, interaction: discord.Interaction):
-        if self.progress_view.is_finished:
+        # 使用 is_completed 判斷狀態
+        if self.progress_view.is_completed:
             await interaction.response.send_message(
                 "⚠️ 該任務已結案或已逾期！", ephemeral=True
             )
             return
 
-        self.progress_view.is_finished = True
+        self.progress_view.is_completed = True
         self.progress_view.stop()
         for item in self.progress_view.children:
             item.disabled = True
@@ -307,7 +308,6 @@ class TaskSubmissionModal(Modal, title="任務成果回報"):
 
         proof_text = self.proof.value.strip()
 
-        # 恢復原汁原味的「🐾 碳碳審核中...」卡片格式
         embed = discord.Embed(
             title="🐾 碳碳審核中...",
             description=(
@@ -321,7 +321,7 @@ class TaskSubmissionModal(Modal, title="任務成果回報"):
             color=discord.Color.gold(),
         )
 
-        # 擷取成果內有效圖片網址（排除 Discord 自訂表情與貼圖）
+        # 擷取有效圖片網址（排除 Discord 自訂表情與貼圖）
         img_urls = re.findall(
             r"https?://\S+\.(?:png|jpg|jpeg|gif|webp)(?:\?\S*)?",
             proof_text,
@@ -331,13 +331,15 @@ class TaskSubmissionModal(Modal, title="任務成果回報"):
             (
                 url
                 for url in img_urls
-                if not re.search(r"(?:cdn|media)\.discordapp\.(?:com|net)/(?:emojis|stickers)/", url)
+                if not re.search(
+                    r"(?:cdn|media)\.discordapp\.(?:com|net)/(?:emojis|stickers)/",
+                    url,
+                )
             ),
             None,
         )
 
-        # 若使用者有交成果圖：大圖放成果圖，右上角縮圖放碳碳
-        # 若使用者沒交圖：大圖直接放碳碳 GIF
+        # 成果帶圖時顯示大圖並將碳碳放在右上角縮圖；沒圖時大圖顯示碳碳
         if valid_img_url:
             embed.set_image(url=valid_img_url)
             embed.set_thumbnail(url=CARBON_CAT_GIF_URL)
@@ -356,7 +358,6 @@ class TaskSubmissionModal(Modal, title="任務成果回報"):
                 view=audit_view,
             )
         except discord.HTTPException:
-            # 若自訂圖床報錯，回退為純碳碳圖
             embed.set_image(url=CARBON_CAT_GIF_URL)
             embed.set_thumbnail(url=None)
             await interaction.channel.send(
@@ -381,14 +382,15 @@ class TaskProgressView(View):
         self.target_user = target_user
         self.task_name = task_name
         self.stamp_reward = stamp_reward
-        self.is_finished = False
+        # 使用 is_completed 避免覆蓋 View 原生 is_finished 方法
+        self.is_completed = False
         self.message: discord.Message | None = None
 
     async def on_timeout(self):
-        if self.is_finished:
+        if self.is_completed:
             return
 
-        self.is_finished = True
+        self.is_completed = True
         for item in self.children:
             item.disabled = True
 
@@ -413,7 +415,7 @@ class TaskProgressView(View):
             )
             return
 
-        if self.is_finished:
+        if self.is_completed:
             await interaction.response.send_message(
                 "⚠️ 該任務已結案或已逾期！", ephemeral=True
             )
@@ -440,13 +442,13 @@ class TaskProgressView(View):
             )
             return
 
-        if self.is_finished:
+        if self.is_completed:
             await interaction.response.send_message(
                 "⚠️ 該任務已結案或已逾期！", ephemeral=True
             )
             return
 
-        self.is_finished = True
+        self.is_completed = True
         self.stop()
         for item in self.children:
             item.disabled = True
