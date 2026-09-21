@@ -12,7 +12,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-DB_NAME = "stamps.db"
+if os.path.exists("/data"):
+    DB_NAME = "/data/stamps.db"
+else:
+    DB_NAME = "stamps.db"
 
 # 審核者身分組 ID
 AUDITOR_ROLE_ID = 1527104229045436416
@@ -52,30 +55,27 @@ def get_user_stamp(user_id: int | str) -> float:
 
 
 def add_user_stamp(user_id: int | str, amount: float) -> float:
-    """記憶體精確計算，明確寫入並即時 Commit，避免 WAL 髒讀"""
+    """利用 SQLite 原生 UPSERT 與 RETURNING 確保計算原子性，杜絕髒讀"""
     uid = int(user_id)
+    amt = round(float(amount), 2)
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # 1. 取得現有數值
-        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (uid,))
-        row = cursor.fetchone()
-        current_count = round(float(row[0]), 2) if row and row[0] is not None else 0.0
-
-        # 2. 進行計算（限制下限為 0）
-        new_count = max(0.0, round(current_count + float(amount), 2))
-
-        # 3. 寫回資料庫
         cursor.execute(
             """
             INSERT INTO stamps (user_id, count)
-            VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET count = excluded.count;
+            VALUES (?, MAX(0.0, ?))
+            ON CONFLICT(user_id) DO UPDATE SET 
+                count = MAX(0.0, ROUND(stamps.count + excluded.count, 2))
+            RETURNING count;
             """,
-            (uid, new_count),
+            (uid, amt),
         )
+        row = cursor.fetchone()
         conn.commit()
 
-        print(f"[DB Log] 使用者 {uid}: 原有 {current_count} + 變更 {amount} = 最終 {new_count}")
+        new_count = round(float(row[0]), 2) if row else 0.0
+        print(f"[DB Log] 使用者 {uid}: 變更 {amt} -> 最終 {new_count}")
         return new_count
 
 
