@@ -18,12 +18,12 @@ DB_NAME = "stamps.db"
 AUDITOR_ROLE_ID = 1527104229045436416
 
 
-# --- 資料庫操作（線程安全與原子操作） ---
+# --- 資料庫操作（線程安全與明確計算） ---
 
 
 def get_db_connection():
     """取得資料庫連線並啟用 WAL 模式提高並發穩定性"""
-    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    conn = sqlite3.connect(DB_NAME, timeout=15.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
@@ -42,25 +42,27 @@ def init_db():
         conn.commit()
 
 
-def get_user_stamp(user_id: int) -> float:
+def get_user_stamp(user_id: int | str) -> float:
+    uid = int(user_id)
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (uid,))
         row = cursor.fetchone()
-        return round(row[0], 2) if row else 0.0
+        return round(float(row[0]), 2) if row and row[0] is not None else 0.0
 
 
-def add_user_stamp(user_id: int, amount: float) -> float:
-    """使用明確交易保證正確加減（包含負數扣章），並限制印章數量不得低於 0"""
+def add_user_stamp(user_id: int | str, amount: float) -> float:
+    """記憶體精確計算，明確寫入並即時 Commit，避免 WAL 髒讀"""
+    uid = int(user_id)
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        # 1. 先查出目前印章數
-        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (user_id,))
+        # 1. 取得現有數值
+        cursor.execute("SELECT count FROM stamps WHERE user_id = ?", (uid,))
         row = cursor.fetchone()
+        current_count = round(float(row[0]), 2) if row and row[0] is not None else 0.0
 
-        current_count = row[0] if row else 0.0
-        # 2. 在 Python 端做精確的加減與下限防護
-        new_count = max(0.0, round(current_count + amount, 2))
+        # 2. 進行計算（限制下限為 0）
+        new_count = max(0.0, round(current_count + float(amount), 2))
 
         # 3. 寫回資料庫
         cursor.execute(
@@ -69,9 +71,11 @@ def add_user_stamp(user_id: int, amount: float) -> float:
             VALUES (?, ?)
             ON CONFLICT(user_id) DO UPDATE SET count = excluded.count;
             """,
-            (user_id, new_count),
+            (uid, new_count),
         )
         conn.commit()
+
+        print(f"[DB Log] 使用者 {uid}: 原有 {current_count} + 變更 {amount} = 最終 {new_count}")
         return new_count
 
 
@@ -213,9 +217,14 @@ class AuditView(View):
         for item in self.children:
             item.disabled = True
 
-        # 使用執行緒池寫入資料庫，避免阻塞
+        # 強制使用成員 ID 整數，避免型態傳遞錯誤
+        target_uid = (
+            self.target_user.id
+            if hasattr(self.target_user, "id")
+            else int(self.target_user)
+        )
         total = await asyncio.to_thread(
-            add_user_stamp, self.target_user.id, self.stamp_reward
+            add_user_stamp, target_uid, self.stamp_reward
         )
 
         embed = (
@@ -369,20 +378,18 @@ class TaskProgressView(View):
 
         proof_text = msg.content.strip() or "（執行者未附帶文字說明）"
         
-        # 處理檔案上傳：下載原始附件並包裝為 Bot 的 File，徹底杜絕刪除訊息後造成的 CDN 破圖與下載失敗
+        # 讀取並重新封裝檔案，使用安全英文名稱避免中文檔名導致卡片大圖失效
         upload_file: discord.File | None = None
         if msg.attachments:
             try:
                 att = msg.attachments[0]
                 file_bytes = await att.read()
-                # 取得副檔名（預設 png），避免中文檔名或特殊字元導致 Embed 無法渲染
                 ext = att.filename.split(".")[-1] if "." in att.filename else "png"
                 safe_filename = f"proof_{int(time.time())}.{ext}"
                 upload_file = discord.File(io.BytesIO(file_bytes), filename=safe_filename)
             except Exception as e:
                 print(f"讀取回報附件失敗: {e}")
 
-        # 若未上傳檔案但包含外站圖片連結，提取之
         image_url = None
         if not upload_file:
             img_urls = re.findall(
@@ -442,7 +449,6 @@ class TaskProgressView(View):
         except discord.HTTPException as e:
             print(f"發送審核卡片失敗: {e}")
 
-        # 刪除原訊息（現在即使刪除，Bot 已重新轉發圖片，不會再出現下載失敗或破圖）
         try:
             await msg.delete()
         except (discord.HTTPException, discord.Forbidden):
@@ -548,7 +554,6 @@ class TaskPublishView(View):
         for item in self.children:
             item.disabled = True
 
-        # 更新原始發布訊息卡片
         await interaction.response.edit_message(
             content=f"⚔️ {self.target_user.mention} 接受了由 {self.author.mention} 發布的任務【{self.task_name}】！",
             view=self,
@@ -563,7 +568,6 @@ class TaskPublishView(View):
         )
         expire_time = int(time.time()) + self.time_limit
 
-        # 使用 followup.send 避免缺少常態發言權限與 3 秒逾時問題
         try:
             msg = await interaction.followup.send(
                 f"⏳ {self.target_user.mention} 正在進行任務：**{self.task_name}**\n"
@@ -659,26 +663,28 @@ async def assign_task(
     stamps: float,
     seconds: int = 3600,
 ):
+    await interaction.response.defer()
+
     if not is_auditor_or_admin(interaction.user):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ 只有審核身分組或管理員才能發布任務！", ephemeral=True
         )
         return
 
     if member.id == interaction.user.id:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ 不能指派任務給自己！", ephemeral=True
         )
         return
 
     if member.bot:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ 不能指派任務給機器人！", ephemeral=True
         )
         return
 
     if stamps <= 0:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ 獎勵印章數必須大於 0！", ephemeral=True
         )
         return
@@ -691,17 +697,16 @@ async def assign_task(
         stamp_reward=round(stamps, 2),
         time_limit=valid_seconds,
     )
-    await interaction.response.send_message(
+
+    msg = await interaction.followup.send(
         f"📜 {member.mention}，你收到來自 {interaction.user.mention} 的新任務！\n"
         f"**任務內容**：{task}\n"
         f"**獎勵印章**：`{round(stamps, 2):g}` 枚\n"
         f"**時限**：`{valid_seconds}` 秒（約 {round(valid_seconds / 60, 1)} 分鐘）",
         view=view,
+        wait=True,
     )
-    try:
-        view.message = await interaction.fetch_original_response()
-    except Exception:
-        pass
+    view.message = msg
 
 
 @bot.tree.command(
@@ -718,7 +723,6 @@ async def add_stamp(
         )
         return
 
-    # 先 defer 預留處理時間，避免 10062 Unknown interaction
     await interaction.response.defer()
 
     total = await asyncio.to_thread(add_user_stamp, member.id, round(amount, 2))
